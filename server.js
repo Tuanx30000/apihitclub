@@ -1,404 +1,350 @@
-const WebSocket = require('ws');
-const http = require('http');
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
-// ================= CONFIG =================
-const WS_URL = "wss://p6v9aiuvb60me.cq.qnwxdhwica.com/";
-const PORT = 3000;
-const WATCHDOG_SECONDS = 45;
+// ======================
+// Cấu hình
+// ======================
+const HOST = '0.0.0.0';
+const POLL_INTERVAL = 5000; // 5 giây
+const RETRY_DELAY = 5000;   // 5 giây
+const MAX_HISTORY = 50;
 
-// ================= DATA =================
-let latestResult = null;
-let lastSession = 0;
-let ws = null;
-let heartbeatInterval = null;
-let watchdogTimer = null;
-let reconnectTimer = null;
-let lastResultTime = Date.now();
-let isHandshakeDone = false;
+// File lưu lịch sử
+const HISTORY_FILE = path.join(__dirname, 'hit_history.json');
 
-const history = [];
-const MAX_HISTORY = 100;
+// ======================
+// Biến toàn cục
+// ======================
+let latestResult100 = {
+    Phien: 0,
+    Xuc_xac_1: 0,
+    Xuc_xac_2: 0,
+    Xuc_xac_3: 0,
+    Tong: 0,
+    Ket_qua: "Chưa có",
+    id: "djtuancon"
+};
 
-// ================= PACKETS =================
-const GAME_END_ROUTE = Buffer.from('mnmdsbgameend');
-const GAME_START_ROUTE = Buffer.from('mnmdsbgamestart');
+let latestResult101 = {
+    Phien: 0,
+    Xuc_xac_1: 0,
+    Xuc_xac_2: 0,
+    Xuc_xac_3: 0,
+    Tong: 0,
+    Ket_qua: "Chưa có",
+    id: "djtuancon"
+};
 
-const PKT_AUTH = 'BAAATQEEAAEIAhDKARpAMWZkNDcwMTdlZDE1NGVhMzgyMGQ0ZjZmZmEyODg1NTMxM2ZlMTY4NDIwZDk0OWI2YWY0ZWQxYjllZDI2ZWEzYUIA';
-const PKT_ENTER_ROOM = 'BAAAJQAFIm1ubWRzYi5tbm1kc2JoYW5kbGVyLmVudGVyZ2FtZXJvb20=';
-const PKT_GET_SCENE = 'BAAAJAAGIW1ubWRzYi5tbm1kc2JoYW5kbGVyLmdldGdhbWVzY2VuZQ==';
-const PKT_REQ_HISTORY = 'BAAAJAAHIW1ubWRzYi5tbm1kc2JoYW5kbGVyLnJlcXBva2VyaW5mbw==';
+let history100 = [];
+let history101 = [];
 
-// ================= TOOL FUNCTIONS =================
-function findRouteEnd(buf, route) {
-    for (let i = 4; i < buf.length - route.length; i++) {
-        let found = true;
-        for (let j = 0; j < route.length; j++) {
-            if (buf[i + j] !== route[j]) {
-                found = false;
-                break;
-            }
-        }
-        if (found) return i + route.length;
-    }
-    return -1;
+let lastSid100 = null;
+let lastSid101 = null;
+let sidForTx = null;
+
+// Lock cho đồng bộ (dùng mutex)
+let isUpdating100 = false;
+let isUpdating101 = false;
+
+// ======================
+// Hàm phụ trợ
+// ======================
+function getTaiXiu(d1, d2, d3) {
+    const total = d1 + d2 + d3;
+    return total <= 10 ? "Xỉu" : "Tài";
 }
 
-function extractMD5Hash(pack, startOffset) {
-    let offset = startOffset;
+function saveHistoryToFile() {
     try {
-        while (offset < pack.length - 34) {
-            let possible = true;
-            for (let k = 0; k < 32; k++) {
-                const c = pack[offset + k];
-                if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) {
-                    possible = false;
-                    break;
-                }
-            }
-            if (possible) {
-                return Buffer.from(pack.slice(offset, offset + 32)).toString('utf8');
-            }
-            offset++;
-        }
-    } catch (e) {}
-    return "";
-}
-
-function readVarint(bytes, offset) {
-    let result = 0;
-    let shift = 0;
-    while (offset < bytes.length) {
-        let b = bytes[offset++];
-        result |= (b & 0x7F) << shift;
-        if (!(b & 0x80)) {
-            return { value: result, newOffset: offset };
-        }
-        shift += 7;
-    }
-    return { value: result, newOffset: offset };
-}
-
-// ================= PREDICTION =================
-function getPrediction() {
-    if (history.length < 5) {
-        return {
-            du_doan: "CHỜ THÊM DỮ LIỆU",
-            do_tin_cay: "THẤP",
-            khuyen_nghi: "Chờ thêm dữ liệu"
+        const data = {
+            lastUpdated: new Date().toISOString(),
+            history100: history100,
+            history101: history101
         };
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(data, null, 2));
+    } catch (error) {
+        console.error(`❌ Lỗi lưu lịch sử: ${error.message}`);
     }
-
-    const recent = history.slice(0, 10);
-    let tai = 0, xiu = 0;
-    recent.forEach(i => {
-        if (i.ket_qua === "TÀI") tai++;
-        if (i.ket_qua === "XỈU") xiu++;
-    });
-
-    const last = recent[0]?.ket_qua;
-    const prev = recent[1]?.ket_qua;
-
-    let predict = "TÀI";
-    let confidence = "THẤP";
-    let advice = "Đánh nhẹ";
-
-    if (last === prev && last) {
-        predict = last;
-        confidence = "CAO";
-        advice = "Vào mạnh";
-    } else {
-        predict = last === "TÀI" ? "XỈU" : "TÀI";
-        confidence = "TRUNG BÌNH";
-        advice = "Cân nhắc";
-    }
-
-    if (tai >= 7) {
-        predict = "TÀI";
-        confidence = "CAO";
-        advice = "Vào mạnh";
-    } else if (xiu >= 7) {
-        predict = "XỈU";
-        confidence = "CAO";
-        advice = "Vào mạnh";
-    }
-
-    return { du_doan: predict, do_tin_cay: confidence, khuyen_nghi: advice };
 }
 
-// ================= SAVE RESULT =================
-function saveResult(session, dice1, dice2, dice3, hash) {
-    if (!session) return;
-
-    lastResultTime = Date.now();
-
-    const total = dice1 + dice2 + dice3;
-    let result = total > 10 ? "TÀI" : "XỈU";
-    if (dice1 === dice2 && dice2 === dice3) result = "BÃO";
-
-    const prediction = getPrediction();
-    const now = new Date();
-    const vnTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (7 * 3600000));
-    const timeString = vnTime.toLocaleString("vi-VN", { hour12: false });
-
-    latestResult = {
-        app: "@tuanx3000",
-        phien: session,
-        xuc_xac: [dice1, dice2, dice3],
-        tong: total,
-        ket_qua: result,
-        md5: hash || "",
-        du_doan: prediction.du_doan,
-        do_tin_cay: prediction.do_tin_cay,
-        khuyen_nghi: prediction.khuyen_nghi,
-        thoi_gian: timeString
-    };
-
-    if (!history.some(item => item.phien === session)) {
-        history.unshift({
-            phien: session,
-            ket_qua: result,
-            tong: total,
-            xuc_xac: [dice1, dice2, dice3],
-            thoi_gian: timeString
-        });
-        if (history.length > MAX_HISTORY) history.pop();
-    }
-
-    console.log(`🎲 Phiên #${session} | ${dice1}-${dice2}-${dice3} | ${result} | Dự đoán: ${prediction.du_doan}`);
-}
-
-// ================= PROCESS POMELO PACKET =================
-function processPomeloPacket(pack) {
-    if (pack.length < 5) return;
-
-    let routeEnd = findRouteEnd(pack, GAME_END_ROUTE);
-    if (routeEnd < 0) {
-        routeEnd = findRouteEnd(pack, GAME_START_ROUTE);
-    }
-    if (routeEnd < 0) return;
-
-    let offset = routeEnd;
-    let foundSession = 0;
-    let diceArr = [];
-    const md5Hash = extractMD5Hash(pack, routeEnd);
-
+function loadHistoryFromFile() {
     try {
-        while (offset < pack.length) {
-            const info = readVarint(pack, offset);
-            if (info.newOffset >= pack.length) break;
-            const wireType = info.value & 7;
-            offset = info.newOffset;
-
-            if (wireType === 0) {
-                const v = readVarint(pack, offset);
-                offset = v.newOffset;
-                if (v.value >= 10000 && v.value <= 99999 && foundSession === 0) {
-                    foundSession = v.value;
-                }
-            } else if (wireType === 2) {
-                const lenInfo = readVarint(pack, offset);
-                const len = lenInfo.value;
-                offset = lenInfo.newOffset;
-                if (len === 3 && diceArr.length === 0) {
-                    const v1 = pack[offset];
-                    const v2 = pack[offset + 1];
-                    const v3 = pack[offset + 2];
-                    if (v1 >= 1 && v1 <= 12 && v2 >= 1 && v2 <= 12 && v3 >= 1 && v3 <= 12) {
-                        const doubled = (v1 % 2 === 0 && v2 % 2 === 0 && v3 % 2 === 0);
-                        diceArr = doubled ? [v1 / 2, v2 / 2, v3 / 2] : [v1, v2, v3];
-                    }
-                }
-                offset += len;
-            } else if (wireType === 1) {
-                offset += 8;
-            } else if (wireType === 5) {
-                offset += 4;
-            } else {
-                break;
+        if (fs.existsSync(HISTORY_FILE)) {
+            const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+            if (data.history100 && Array.isArray(data.history100)) {
+                history100 = data.history100;
+                console.log(`📂 Đã load ${history100.length} phiên lịch sử TX`);
+            }
+            if (data.history101 && Array.isArray(data.history101)) {
+                history101 = data.history101;
+                console.log(`📂 Đã load ${history101.length} phiên lịch sử MD5`);
             }
         }
-    } catch (e) {
-        console.log('Parse error:', e.message);
-    }
-
-    if (foundSession > 0 && diceArr.length === 3 && foundSession !== lastSession) {
-        lastSession = foundSession;
-        saveResult(foundSession, diceArr[0], diceArr[1], diceArr[2], md5Hash);
+    } catch (error) {
+        console.error(`❌ Lỗi đọc lịch sử: ${error.message}`);
     }
 }
 
-// ================= WEBSOCKET =================
-function connect() {
-    console.log("🌐 Đang kết nối WebSocket...");
-
-    // Clear old connection
-    if (ws) {
-        ws.removeAllListeners();
-        ws.close();
-        ws = null;
-    }
-
-    // Clear intervals and timeouts
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
-    clearInterval(watchdogTimer);
-    watchdogTimer = null;
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-
-    // Reset handshake flag
-    isHandshakeDone = false;
-
-    try {
-        ws = new WebSocket(WS_URL, {
-            rejectUnauthorized: false,
-            headers: {
-                Origin: 'https://68gbvn88.bar',
-                'User-Agent': 'Mozilla/5.0'
-            }
-        });
-    } catch (err) {
-        console.log("WS creation error:", err.message);
-        reconnectTimer = setTimeout(connect, 3000);
+function updateResult(store, history, result, isMd5) {
+    const updating = isMd5 ? isUpdating101 : isUpdating100;
+    const setUpdating = isMd5 ? (val) => { isUpdating101 = val; } : (val) => { isUpdating100 = val; };
+    
+    // Chờ nếu đang cập nhật
+    if (updating) {
+        setTimeout(() => updateResult(store, history, result, isMd5), 100);
         return;
     }
+    
+    setUpdating(true);
+    
+    try {
+        // Cập nhật store
+        Object.keys(result).forEach(key => {
+            store[key] = result[key];
+        });
+        
+        // Thêm vào lịch sử (đầu mảng)
+        history.unshift({ ...result });
+        
+        // Giới hạn 50 phiên
+        while (history.length > MAX_HISTORY) {
+            history.pop();
+        }
+        
+        // Lưu vào file
+        saveHistoryToFile();
+    } catch (error) {
+        console.error(`❌ Lỗi cập nhật kết quả: ${error.message}`);
+    } finally {
+        setUpdating(false);
+    }
+}
 
-    ws.on('open', () => {
-        console.log("✅ Connected");
-        ws.send(Buffer.from(
-            'AQAAcnsic3lzIjp7InBsYXRmb3JtIjoianMtd2Vic29ja2V0IiwiY2xpZW50QnVpbGROdW1iZXIiOiIwLjAuMSIsImNsaWVudFZlcnNpb24iOiIwYTIxNDgxZDc0NmY5MmY4NDI4ZTFiNmRlZWI3NmZlYSJ9fQ==',
-            'base64'
-        ));
-        isHandshakeDone = false;
-    });
-
-    ws.on('message', (data) => {
+// ======================
+// Poll API
+// ======================
+async function pollApi(gid, isMd5) {
+    const url = `https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=g8&gid=${gid}`;
+    
+    while (true) {
         try {
-            const buffer = new Uint8Array(data);
-            let offset = 0;
-
-            while (offset < buffer.length) {
-                const pkgType = buffer[offset];
-                const length = (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
-                const pack = buffer.slice(offset, offset + 4 + length);
-                offset += 4 + length;
-
-                if (pkgType === 1) {
-                    if (!isHandshakeDone) {
-                        isHandshakeDone = true;
-                        console.log("🤝 Handshake OK");
-                        ws.send(Buffer.from([0x02, 0x00, 0x00, 0x00]));
-
-                        clearInterval(heartbeatInterval);
-                        heartbeatInterval = setInterval(() => {
-                            if (ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(Buffer.from([0x03, 0x00, 0x00, 0x00]));
-                            }
-                        }, 3000);
-
-                        setTimeout(() => ws.send(Buffer.from(PKT_AUTH, 'base64')), 500);
-                        setTimeout(() => ws.send(Buffer.from(PKT_ENTER_ROOM, 'base64')), 1000);
-                        setTimeout(() => ws.send(Buffer.from(PKT_GET_SCENE, 'base64')), 1500);
-                        setTimeout(() => ws.send(Buffer.from(PKT_REQ_HISTORY, 'base64')), 2000);
-
-                        clearInterval(watchdogTimer);
-                        watchdogTimer = setInterval(() => {
-                            const elapsed = Math.round((Date.now() - lastResultTime) / 1000);
-                            if (elapsed >= WATCHDOG_SECONDS) {
-                                console.log("⚠️ Timeout – reconnecting...");
-                                if (ws) ws.terminate();
-                            }
-                        }, 5000);
+            const response = await axios.get(url, {
+                headers: { 'User-Agent': 'Python-Proxy/1.0' },
+                timeout: 10000
+            });
+            
+            const data = response.data;
+            
+            if (data.status === 'OK' && Array.isArray(data.data)) {
+                // Lấy sid_for_tx từ cmd 1008 (chỉ cho bàn thường)
+                if (!isMd5) {
+                    for (const game of data.data) {
+                        const cmd = game.cmd;
+                        if (cmd === 1008) {
+                            sidForTx = game.sid;
+                            // console.log(`📌 Cập nhật sid_for_tx: ${sidForTx}`);
+                        }
                     }
-                } else if (pkgType === 3) {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(Buffer.from([0x03, 0x00, 0x00, 0x00]));
+                }
+                
+                // Xử lý từng game
+                for (const game of data.data) {
+                    const cmd = game.cmd;
+                    
+                    // Xử lý MD5 (cmd 2006)
+                    if (isMd5 && cmd === 2006) {
+                        const sid = game.sid;
+                        const d1 = game.d1;
+                        const d2 = game.d2;
+                        const d3 = game.d3;
+                        
+                        if (sid && sid !== lastSid101 && d1 !== undefined && d2 !== undefined && d3 !== undefined) {
+                            lastSid101 = sid;
+                            const total = d1 + d2 + d3;
+                            const ketQua = getTaiXiu(d1, d2, d3);
+                            
+                            const result = {
+                                Phien: sid,
+                                Xuc_xac_1: d1,
+                                Xuc_xac_2: d2,
+                                Xuc_xac_3: d3,
+                                Tong: total,
+                                Ket_qua: ketQua,
+                                id: "djtuancon"
+                            };
+                            
+                            updateResult(latestResult101, history101, result, true);
+                            console.log(`[MD5] Phiên ${sid} - ${d1} ${d2} ${d3} = ${total} (${ketQua})`);
+                        }
                     }
-                } else if (pkgType === 4) {
-                    processPomeloPacket(pack);
+                    
+                    // Xử lý bàn thường (cmd 1003)
+                    else if (!isMd5 && cmd === 1003) {
+                        const d1 = game.d1;
+                        const d2 = game.d2;
+                        const d3 = game.d3;
+                        const sid = sidForTx;
+                        
+                        if (sid && sid !== lastSid100 && d1 !== undefined && d2 !== undefined && d3 !== undefined) {
+                            lastSid100 = sid;
+                            const total = d1 + d2 + d3;
+                            const ketQua = getTaiXiu(d1, d2, d3);
+                            
+                            const result = {
+                                Phien: sid,
+                                Xuc_xac_1: d1,
+                                Xuc_xac_2: d2,
+                                Xuc_xac_3: d3,
+                                Tong: total,
+                                Ket_qua: ketQua,
+                                id: "djtuancon"
+                            };
+                            
+                            updateResult(latestResult100, history100, result, false);
+                            console.log(`[TX] Phiên ${sid} - ${d1} ${d2} ${d3} = ${total} (${ketQua})`);
+                            sidForTx = null;
+                        }
+                    }
                 }
             }
-        } catch (e) {
-            console.log('Message error:', e.message);
+        } catch (error) {
+            console.error(`❌ Lỗi khi lấy dữ liệu API ${gid}: ${error.message}`);
+            if (error.response) {
+                console.error(`   Status: ${error.response.status}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
         }
-    });
+        
+        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    }
+}
 
-    ws.on('close', (code, reason) => {
-        console.log(`❌ Disconnected - code: ${code}, reason: ${String(reason)}`);
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-        clearInterval(watchdogTimer);
-        watchdogTimer = null;
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(connect, 3000);
-    });
+// ======================
+// Express App
+// ======================
+const app = express();
 
-    ws.on('error', (err) => {
-        console.log("WS Error:", err.message);
-        if (ws) {
-            ws.close(); // trigger close event for reconnect
-        }
+// Middleware CORS
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+    }
+    next();
+});
+
+// Routes
+app.get("/api/taixiu", (req, res) => {
+    res.json(latestResult100);
+});
+
+app.get("/api/taixiumd5", (req, res) => {
+    res.json(latestResult101);
+});
+
+app.get("/api/history", (req, res) => {
+    res.json({
+        taixiu: history100,
+        taixiumd5: history101
+    });
+});
+
+app.get("/api/history/taixiu", (req, res) => {
+    res.json({
+        total: history100.length,
+        history: history100
+    });
+});
+
+app.get("/api/history/md5", (req, res) => {
+    res.json({
+        total: history101.length,
+        history: history101
+    });
+});
+
+app.get("/api/status", (req, res) => {
+    res.json({
+        status: "running",
+        last_sid: {
+            taixiu: lastSid100,
+            md5: lastSid101
+        },
+        current_result: {
+            taixiu: latestResult100,
+            md5: latestResult101
+        },
+        history_count: {
+            taixiu: history100.length,
+            md5: history101.length
+        },
+        uptime: process.uptime()
+    });
+});
+
+app.get("/", (req, res) => {
+    res.json({
+        name: "Hit Tài Xỉu API",
+        version: "1.0.0",
+        description: "API Server for TaiXiu from Hit platform",
+        endpoints: {
+            "/api/taixiu": "Kết quả tài xỉu mới nhất (bàn thường)",
+            "/api/taixiumd5": "Kết quả tài xỉu mới nhất (bàn MD5)",
+            "/api/history": "Lịch sử cả 2 bàn",
+            "/api/history/taixiu": "Lịch sử bàn thường",
+            "/api/history/md5": "Lịch sử bàn MD5",
+            "/api/status": "Trạng thái hệ thống"
+        },
+        polling_interval: `${POLL_INTERVAL/1000}s`,
+        max_history: MAX_HISTORY
+    });
+});
+
+// ======================
+// Khởi động
+// ======================
+async function main() {
+    console.log("=".repeat(50));
+    console.log("🚀 Khởi động hệ thống API Tài Xỉu Hit...");
+    console.log("=".repeat(50));
+    
+    // Load lịch sử từ file
+    loadHistoryFromFile();
+    
+    // Khởi động polling
+    console.log("📡 Bắt đầu polling dữ liệu...");
+    console.log(`   - Bàn thường (vgmn_100): mỗi ${POLL_INTERVAL/1000}s`);
+    console.log(`   - Bàn MD5 (vgmn_101): mỗi ${POLL_INTERVAL/1000}s`);
+    
+    // Chạy polling không đồng bộ
+    pollApi("vgmn_100", false);
+    pollApi("vgmn_101", true);
+    
+    const PORT = process.env.PORT || 1003;
+    app.listen(PORT, HOST, () => {
+        console.log("\n" + "=".repeat(50));
+        console.log("🌐 HTTP SERVER ĐANG CHẠY");
+        console.log("=".repeat(50));
+        console.log(`   📍 http://${HOST}:${PORT}/api/taixiu       - Kết quả TX mới nhất`);
+        console.log(`   📍 http://${HOST}:${PORT}/api/taixiumd5    - Kết quả MD5 mới nhất`);
+        console.log(`   📍 http://${HOST}:${PORT}/api/history      - Lịch sử (50 phiên)`);
+        console.log(`   📍 http://${HOST}:${PORT}/api/status       - Trạng thái`);
+        console.log(`   📍 http://${HOST}:${PORT}/                 - Thông tin`);
+        console.log("=".repeat(50));
+        console.log(`📁 File lịch sử: ${HISTORY_FILE}`);
+        console.log("=".repeat(50));
     });
 }
 
-// ================= HTTP SERVER =================
-const server = http.createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-
-    if (req.url === '/taixiumd5') {
-        res.writeHead(200);
-        res.end(JSON.stringify({
-            status: "success",
-            app: "@tuanx3000",
-            data: latestResult
-        }, null, 2));
-    } else if (req.url === '/history') {
-        res.writeHead(200);
-        res.end(JSON.stringify({
-            app: "@tuanx3000",
-            total: history.length,
-            history: history
-        }, null, 2));
-    } else if (req.url === '/stats') {
-        const tai = history.filter(item => item.ket_qua === "TÀI").length;
-        const xiu = history.filter(item => item.ket_qua === "XỈU").length;
-        const bao = history.filter(item => item.ket_qua === "BÃO").length;
-        res.writeHead(200);
-        res.end(JSON.stringify({
-            app: "@tuanx3000",
-            total: history.length,
-            tai: tai,
-            xiu: xiu,
-            bao: bao,
-            last_update: latestResult?.thoi_gian || null
-        }, null, 2));
-    } else {
-        res.writeHead(404);
-        res.end(JSON.stringify({
-            error: "Not found",
-            endpoints: ["/taixiumd5", "/history", "/stats"]
-        }, null, 2));
-    }
+// Xử lý thoát
+process.on('SIGINT', () => {
+    console.log("\n🛑 Đang dừng chương trình...");
+    saveHistoryToFile();
+    setTimeout(() => process.exit(0), 1000);
 });
 
-// ================= START =================
-console.clear();
-console.log("🔴 68GB TÀI XỈU MD5 (SỬA LỖI)");
-console.log(`🌐 API: http://localhost:${PORT}/taixiumd5`);
-console.log(`📜 HISTORY: http://localhost:${PORT}/history`);
-console.log(`📊 STATS: http://localhost:${PORT}/stats`);
-console.log("====================================");
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    connect();
-});
-
-// Bắt lỗi uncaught để tránh crash
-process.on('uncaughtException', (err) => {
-    console.error('[UNCAUGHT]', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-    console.error('[UNHANDLED]', reason);
-});
+main();
